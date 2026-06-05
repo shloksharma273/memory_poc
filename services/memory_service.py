@@ -14,8 +14,7 @@ from services.graph_service import upsert_entity, create_relationship
 
 def add_memory(user_id: str, message: str) -> dict:
     """
-    Full ingestion pipeline for a single user message.
-    Returns a summary dict with status and counts.
+    Store memory event and queue the ingestion job.
     """
     db = get_db()
 
@@ -30,14 +29,49 @@ def add_memory(user_id: str, message: str) -> dict:
     db.collection("memory_events").insert(event_doc)
     print(f"  ✓ Stored memory event: {event_key}")
 
-    # ── 2. Extract entities & relationships via LLM ──────────────────
+    # ── 2. Create ingestion_log entry ────────────────────────────────
+    log_doc = {
+        "memory_event_id": event_key,
+        "user_id": user_id,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "retry_count": 0
+    }
+    db.collection("memory_ingestion_log").insert(log_doc)
+    print(f"  ✓ Queued memory event {event_key} for ingestion")
+
+    return {
+        "success": True,
+        "memory_event_id": event_key,
+        "queued": True,
+    }
+
+
+def process_memory_event(event_key: str) -> None:
+    """
+    Executes LLM entity extraction, graph construction, and embedding generation
+    synchronously for a stored event. Used by the background worker.
+    """
+    db = get_db()
+
+    event_doc = db.collection("memory_events").get(event_key)
+    if not event_doc:
+        raise ValueError(f"Memory event not found: {event_key}")
+
+    user_id = event_doc["user_id"]
+    message = event_doc["message"]
+
+    # ── 1. Extract entities & relationships via LLM ──────────────────
     extraction = extract_entities(message)
     print(
         f"  ✓ Extracted {len(extraction.entities)} entities, "
         f"{len(extraction.relationships)} relationships"
     )
 
-    # ── 3. Build knowledge graph ─────────────────────────────────────
+    # ── 2. Build knowledge graph ─────────────────────────────────────
     # Always ensure the user node exists
     upsert_entity(user_id, "user")
 
@@ -58,7 +92,7 @@ def add_memory(user_id: str, message: str) -> dict:
         f"{relationships_created} relationships"
     )
 
-    # ── 4. Generate & store embedding ────────────────────────────────
+    # ── 3. Generate & store embedding ────────────────────────────────
     embedding = generate_embedding(message)
     emb_doc = {
         "_key": f"emb_{event_key}",
@@ -69,10 +103,3 @@ def add_memory(user_id: str, message: str) -> dict:
     }
     db.collection("memory_embeddings").insert(emb_doc)
     print(f"  ✓ Stored embedding (dim={len(embedding)})")
-
-    return {
-        "status": "success",
-        "event_key": event_key,
-        "entities_created": entities_created,
-        "relationships_created": relationships_created,
-    }

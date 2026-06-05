@@ -11,7 +11,7 @@ def setup_collections():
     db = get_db()
 
     # Document collections
-    for name in ["memory_events", "entities", "memory_embeddings"]:
+    for name in ["memory_events", "entities", "memory_embeddings", "memory_ingestion_log"]:
         if not db.has_collection(name):
             db.create_collection(name)
             print(f"  ✓ Created collection: {name}")

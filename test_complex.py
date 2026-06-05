@@ -36,7 +36,10 @@ def test_complex_scenario():
         print(f"\nAdding memory: '{item['message']}'")
         res = requests.post(f"{BASE_URL}/memory/add", json=item)
         print(f"-> Result: {res.json()}")
-        time.sleep(1)  # small pause to separate timestamps
+        time.sleep(0.5)  # small pause to separate timestamps
+
+    print("\nWaiting 15 seconds for background worker to process all memories...")
+    time.sleep(15)
 
     # 2. View Alice's Knowledge Graph
     print("\nFetching Knowledge Graph for Alice...")

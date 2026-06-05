@@ -1,4 +1,5 @@
 import json
+import time
 import requests
 
 BASE_URL = "http://localhost:8000"
@@ -20,6 +21,8 @@ def test_memory_poc():
         response = requests.post(f"{BASE_URL}/memory/add", json=add_payload)
         response.raise_for_status()
         print_json("Add Memory Response", response.json())
+        print("Waiting 7 seconds for asynchronous processing to complete...")
+        time.sleep(7)
     except Exception as e:
         print(f"Error adding memory: {e}")
         return

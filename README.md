@@ -9,21 +9,31 @@ The purpose of this POC is to demonstrate how **ArangoDB** acts as a unified mem
 ## High-Level Architecture
 
 ### Write Pipeline (Ingestion Path)
-When a message is posted to `/memory/add`, the system processes it through a synchronous pipeline:
+When a message is posted to `/memory/add`, the system processes it using an asynchronous, log-structured write-optimized queue:
 
+#### Fast Path (Synchronous lifecycle)
 ```
 [ User Message ] ──> Store Raw Event (Document) ──> memory_events
        │
-       ├───> Extract Entities & Relationships (LLM: qwen2.5-coder:7b)
-       │         │
-       │         └───> Map "user" node references to actual user_id
-       │         └───> Normalize keys to lower_snake_case
-       │         └───> Upserts into Knowledge Graph ──> entities (nodes) & relations (edges)
-       │
-       └───> Generate text embedding (Vector: nomic-embed-text)
-                 │
-                 └───> Link to parent memory event ID ──> memory_embeddings
+       └───> Create pending task ──> memory_ingestion_log ──> Return HTTP 200 (Queued)
 ```
+
+#### Slow Path (Asynchronous worker thread or daemon process)
+```
+[ Ingestion Worker ] ──> Read pending ingestion log (atomic fetch & lock)
+                              │
+                              ├───> Extract Entities & Relationships (LLM: qwen2.5-coder:7b)
+                              │         │
+                              │         └───> Map "user" node references to actual user_id
+                              │         └───> Normalize keys to lower_snake_case
+                              │         └───> Upserts into Knowledge Graph ──> entities (nodes) & relations (edges)
+                              │
+                              └───> Generate text embedding (Vector: nomic-embed-text)
+                                        │
+                                        └───> Link to parent memory event ID ──> memory_embeddings
+```
+
+---
 
 ### Read Pipeline (Retrieval Path)
 When a query is searched via `/memory/search`, three retrieval strategies run and merge:
@@ -61,11 +71,12 @@ When a query is searched via `/memory/search`, three retrieval strategies run an
 
 ## DB Collections & Schemas
 
-The `memory_poc` database contains four collections and one full-text search view:
+The `memory_poc` database contains five collections and one full-text search view:
 
 | Collection / View | Type | Fields / Configuration | Purpose |
 | :--- | :--- | :--- | :--- |
 | **`memory_events`** | Document | `user_id`, `message`, `timestamp` | Append-only raw logs |
+| **`memory_ingestion_log`** | Document | `memory_event_id`, `user_id`, `status` (`pending`/`processing`/`completed`/`failed`), `created_at`, `started_at`, `completed_at`, `error`, `retry_count` | Job queue tracking and execution log |
 | **`memory_embeddings`** | Document | `memory_id`, `user_id`, `text`, `embedding` (768-dim) | Semantic vectors |
 | **`entities`** | Document | `name`, `type` | Knowledge Graph nodes |
 | **`relations`** | Edge | `_from`, `_to`, `relation` | Knowledge Graph edges |
@@ -106,13 +117,24 @@ cat .env
 # 4. Start the FastAPI App
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
-On startup, the lifespan hooks will automatically create the database, collections, and the ArangoSearch view.
+On startup, the lifespan hooks will automatically:
+1. Ensure the database, collections, and ArangoSearch view are setup.
+2. Spawn a background ingestion worker thread to automatically process queued jobs.
+
+---
+
+## Running the Standalone Worker
+
+If you prefer to run the worker in a separate OS process rather than as a thread within FastAPI:
+```bash
+python workers/worker_runner.py
+```
 
 ---
 
 ## How to Test
 
-We have provided two integration test scripts:
+We have provided two integration test scripts. These scripts sleep for a few seconds to let the asynchronous background worker finish processing the queued writes before checking results.
 
 ### 1. Simple Test (`test_poc.py`)
 Inserts a single message and validates retrieval:
@@ -130,11 +152,11 @@ python test_complex.py
 
 ## Web UI Database Inspection
 
-To visually inspect the data and the dynamic knowledge graph:
+To visually inspect the data, queue logs, and the dynamic knowledge graph:
 1. Open **[http://localhost:8529](http://localhost:8529)** in your browser.
 2. Log in using `root` and password `openSesame`.
 3. **Crucial:** In the top-right corner, switch the database dropdown from `_system` to **`memory_poc`**.
-4. Browse individual records in the **Collections** tab.
+4. Browse individual records in the **Collections** tab (including the `memory_ingestion_log` queue).
 5. To visualize the graph, go to the **Queries** tab, execute:
    ```aql
    FOR e IN relations RETURN e
@@ -147,7 +169,7 @@ To visually inspect the data and the dynamic knowledge graph:
 
 ```
 memory_poc/
-├── app.py                      # FastAPI App definition & Endpoint Routes
+├── app.py                      # FastAPI App definition (starts worker thread in lifespan)
 ├── config.py                   # Environment Configuration loader
 ├── requirements.txt            # Python dependencies
 ├── .env                        # Configuration defaults
@@ -155,7 +177,7 @@ memory_poc/
 │
 ├── db/                         # Database Lifecycle layer
 │   ├── arango_client.py        # Connection pooling client
-│   ├── setup_collections.py    # Schema initialization logic
+│   ├── setup_collections.py    # Schema initialization logic (added log collection)
 │   └── setup_views.py          # Fulltext index / View configuration
 │
 ├── models/                     # Data contracts layer
@@ -165,12 +187,16 @@ memory_poc/
 │   └── entity_extraction.txt   # Graph Extraction rules & constraints
 │
 ├── services/                   # Business Logic Layer
-│   ├── memory_service.py       # Write Pipeline Coordinator
+│   ├── memory_service.py       # Ingests raw events & exposes processing logic
+│   ├── ingestion_worker.py     # Atomic job retriever & worker processing logic
 │   ├── extraction_service.py   # Ollama JSON extractor wrapper
 │   ├── graph_service.py        # Graph upserting & AQL traversal
 │   ├── embedding_service.py    # Vector generator wrapper
 │   └── retrieval_service.py    # Parallel Search Runner & Merger
 │
-├── test_poc.py                 # Basic functional tests
-└── test_complex.py             # Multi-turn developer scenario simulator
+├── workers/                    # Worker process management
+│   └── worker_runner.py        # Standalone worker daemon script
+│
+├── test_poc.py                 # Basic functional tests (with wait pauses)
+└── test_complex.py             # Multi-turn developer scenario simulator (with wait pauses)
 ```

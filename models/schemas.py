@@ -35,10 +35,9 @@ class ExtractionResult(BaseModel):
 
 class MemoryAddResponse(BaseModel):
     """Response for POST /memory/add"""
-    status: str
-    event_key: str
-    entities_created: int
-    relationships_created: int
+    success: bool
+    memory_event_id: str
+    queued: bool
 
 
 class MemorySearchResponse(BaseModel):

@@ -31,6 +31,14 @@ async def lifespan(app: FastAPI):
     print("\n🧠 Agentic Memory POC — Starting up...")
     setup_collections()
     setup_views()
+
+    # Start background worker thread
+    import threading
+    from services.ingestion_worker import worker_loop
+    worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
+    print("✓ Background worker thread started.")
+
     print("✓ Ready.\n")
     yield
     print("\n🧠 Shutting down.")
