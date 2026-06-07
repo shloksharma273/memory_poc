@@ -1,56 +1,283 @@
-# Arango Agentic Memory — Phase 1 + Phase 2
+# Arango Agentic Memory System
 
-Core Memory Engine with Intelligence Layer: store, classify, deduplicate, score, and retrieve agent memories backed by ArangoDB and Ollama.
-
----
-
-## What Phase 2 adds over Phase 1
-
-| Capability | Phase 1 | Phase 2 |
-|---|---|---|
-| Importance scoring | ✗ | ✓ |
-| Confidence scoring | ✗ | ✓ |
-| Quality score | ✗ | ✓ |
-| Consolidation / deduplication | ✗ | ✓ |
-| Temporal fields (valid_from / valid_to) | ✗ | ✓ |
-| Merge audit log | ✗ | ✓ |
-| Access tracking | ✗ | ✓ |
-| Quality-aware retrieval ranking | ✗ | ✓ |
-| Citation confidence scores | ✗ | ✓ |
+A 3-phase agentic memory engine that stores, classifies, deduplicates, scores, and reflects on agent memories — backed by ArangoDB and Ollama running entirely locally.
 
 ---
 
-## Architecture
+## The Big Picture
+
+The system is not a simple key-value store. It decides *what's worth remembering*, *how certain it is*, *whether it's a duplicate*, and *what patterns are emerging* across memories over time. Think of it like a brain that reads, filters, connects, and reflects on experiences.
+
+Three layers are built on top of each other:
 
 ```
-User / Agent Input
-      ↓
-POST /memory/add
-      ↓
-Candidate Generator  (novelty × source weight → memory_score)
-      ↓
-Memory Classifier    (LLM → episodic | semantic | procedural)
-      ↓
-Entity Extractor     (LLM → named entities)
-      ↓
-Embedding Generator  (Ollama nomic-embed-text)
-      ↓
-Memory Writer        (ArangoDB document + provenance record)
-      ↓
-Graph Linker         (memory_mentions_entity, memory_has_provenance edges)
-      ↓
-POST /memory/retrieve
-      ↓
-Semantic Search      (AQL cosine similarity across all 3 memory collections)
-      ↓
-Graph Traversal      (inbound edges from matched entities)
-      ↓
-Hybrid Fusion        (0.70 × semantic + 0.30 × graph)
-      ↓
-Context Builder      (facts / events / procedures / citations)
-      ↓
-Agent-ready context
+Phase 1 → Store & Retrieve    (the core)
+Phase 2 → Score & Deduplicate (the intelligence)
+Phase 3 → Reflect & Summarize (the wisdom)
 ```
+
+---
+
+## Phase 1 — Core Memory Engine
+
+### Step 1: Input arrives
+
+Raw text arrives at `POST /memory/add` — a support ticket, a CRM note, a runbook entry — with a tenant ID and source system. The system doesn't store it directly. It first decides *whether it deserves to be remembered*.
+
+**Files:** `routes/memory_routes.py`, `models/api_models.py`
+
+---
+
+### Step 2: Candidate Scoring
+
+The text gets an embedding via **nomic-embed-text** (Ollama). That embedding is compared against all existing memories using cosine similarity computed directly in ArangoDB AQL — no separate vector DB needed.
+
+A **novelty score** is calculated: how different is this from what's already stored? Combined with a **source weight** (CRM is more trustworthy than a chat log):
+
+```
+memory_score = 0.60 × novelty + 0.40 × source_weight
+```
+
+If `memory_score < 0.35`, the text is rejected as `not_stored`.
+
+**Files:** `services/candidate_generator.py`, `services/embedding_service.py`, `db/queries.py`
+
+---
+
+### Step 3: Classification
+
+If it passes the threshold, **qwen2.5-coder:7b** (Ollama) classifies the text into one of three memory types:
+
+- **Episodic** — a time-bound event ("Customer ABC reported a failure on Monday")
+- **Semantic** — a stable fact ("Customer ABC uses Payment Gateway X")
+- **Procedural** — a how-to or SOP ("For gateway failures, check the retry queue")
+
+Each type is stored in its own ArangoDB collection.
+
+**Files:** `services/classifier.py`
+
+---
+
+### Step 4: Entity Extraction + Graph Linking
+
+The LLM extracts named entities (people, products, systems). Each entity gets a node in the `entities` collection. Edge collections link the memory to its entities and source document, forming a **knowledge graph**.
+
+**Files:** `services/entity_extractor.py`, `services/graph_service.py`
+
+---
+
+### Step 5: Written to ArangoDB
+
+The classified, embedded, entity-linked memory document is written to the correct collection with full provenance metadata.
+
+**Files:** `services/memory_writer.py`, `db/arango_client.py`, `db/setup_db.py`
+
+---
+
+### Step 6: Retrieval
+
+On `POST /memory/retrieve`, two searches run in parallel:
+
+1. **Semantic search** — embed the query, cosine similarity against all 3 memory collections
+2. **Graph search** — extract entities from the query, traverse edges to find related memories
+
+Results are merged and ranked:
+
+```
+final_score = 0.70 × semantic + 0.30 × graph
+```
+
+The response groups memories into `facts`, `events`, `procedures`, and `citations` — ready for an LLM to use as context.
+
+**Files:** `services/memory_retriever.py`, `services/context_builder.py`, `db/queries.py`
+
+---
+
+## Phase 2 — Intelligence Layer
+
+### Importance Scoring
+
+When a memory is stored it gets an `importance_score`:
+
+```
+importance = 0.40 × impact + 0.25 × frequency + 0.20 × recency + 0.15 × usage
+```
+
+Impact is inferred from language ("critical", "outage" = high). Frequency counts how many near-duplicates were seen. Recency weights recent events higher.
+
+**File:** `services/importance_scorer.py`
+
+---
+
+### Confidence Scoring
+
+```
+confidence = 0.40 × source_reliability + 0.30 × agreement + 0.20 × recency + 0.10 × accuracy
+```
+
+A CRM record has higher source reliability than an anonymous report. Agreement measures whether other memories say the same thing.
+
+**File:** `services/confidence_scorer.py`
+
+---
+
+### Quality Score
+
+```
+quality = 0.60 × importance + 0.40 × confidence
+```
+
+This single number summarizes how much to trust a memory and drives ranking.
+
+---
+
+### Temporal Metadata
+
+Every memory gets `valid_from`, `valid_to`, and `recorded_at` timestamps extracted from the input or inferred from context.
+
+**File:** `services/temporal_service.py`
+
+---
+
+### Consolidation (Deduplication)
+
+When a new memory arrives, before storing it the system checks all existing memories:
+
+```
+consolidation_score = 0.70 × embedding_similarity
+                    + 0.20 × entity_overlap (Jaccard)
+                    + 0.10 × type_match
+```
+
+If `score ≥ 0.80`, it's a near-duplicate — instead of storing a second copy, the system **merges** it into the existing memory, incrementing `duplicate_count` and bumping `confidence_score`.
+
+**File:** `services/consolidation_service.py`
+
+---
+
+### Quality-Aware Retrieval Ranking
+
+```
+final_score = 0.50 × semantic + 0.20 × graph + 0.20 × importance + 0.10 × confidence
+```
+
+High-quality memories naturally rise to the top.
+
+**File:** `services/ranking_service.py`
+
+---
+
+### Schema Migration
+
+Adds Phase 2 fields to existing memories and creates `memory_merge_logs`.
+
+**File:** `migrations/phase_2_schema_migration.py`
+
+---
+
+## Phase 3 — Reflection & Summarization
+
+### Step 1: Candidate Selection
+
+`POST /intelligence/reflect` pulls memories from the last N days with quality above a threshold. These are the candidates for pattern analysis.
+
+**File:** `services/reflection_candidate_selector.py`
+
+---
+
+### Step 2: Clustering
+
+Candidate memories are grouped by similarity:
+
+```
+cluster_score = 0.60 × embedding_sim + 0.25 × entity_overlap
+              + 0.10 × type_match    + 0.05 × time_proximity
+```
+
+Memories that score above `similarity_threshold` against each other are placed in the same cluster.
+
+**File:** `services/memory_clustering_service.py`
+
+---
+
+### Step 3: Pattern Detection
+
+For each cluster with `size ≥ 2`, the LLM is asked: *"Do these memories show a recurring pattern?"* It returns a structured result with `pattern_type` (recurring_issue, behavior_pattern, risk_pattern, etc.) and a `pattern_summary`. A deterministic fallback fires if the LLM call fails.
+
+**File:** `services/pattern_detector.py`
+
+---
+
+### Step 4: Reflective Memory Created
+
+A new document is written to `reflective_memories` — a higher-order memory *about* other memories:
+
+```json
+{
+  "reflection_text": "Customer ABC repeatedly reports payment failures post-deployment",
+  "pattern_type": "recurring_issue",
+  "support_count": 2,
+  "supporting_memory_ids": ["episodic_memories/abc", "episodic_memories/xyz"]
+}
+```
+
+Edge links connect it to the evidence memories.
+
+**File:** `services/reflection_generator.py`
+
+---
+
+### Step 5: Summarization
+
+`POST /intelligence/summarize` groups memories by time window and asks the LLM to write a concise rollup, stored in `summary_memories`.
+
+**File:** `services/summarization_service.py`
+
+---
+
+### Step 6: Reflection-Aware Retrieval
+
+On retrieval, `reflective_memories` and `summary_memories` are searched alongside base memories. The ranking applies a **type boost**:
+
+```
+final_score = 0.40 × semantic + 0.20 × graph + 0.20 × importance
+            + 0.10 × confidence + 0.10 × type_boost
+
+type_boost:  reflective=1.00 | summary=0.85 | procedural=0.80 | semantic=0.70 | episodic=0.60
+```
+
+Reflective memories surface in `context.reflections` — an LLM gets not just raw facts but the patterns the system has detected over time.
+
+**Files:** `services/reflection_retriever.py`, `services/context_builder.py`, `services/ranking_service.py`
+
+---
+
+### Orchestration and Routes
+
+**Files:** `services/phase_3_orchestrator.py`, `routes/intelligence_routes.py`, `migrations/phase_3_schema_migration.py`
+
+---
+
+## Data Flow in One Line
+
+> Raw text → scored for novelty → classified by LLM → embedded and graph-linked → deduplicated against existing memories → scored for importance and confidence → periodically clustered for pattern detection → surfaced as reflective memories in future retrievals.
+
+---
+
+## Tech Stack
+
+| Layer | Tool |
+|---|---|
+| API | FastAPI — `app.py` |
+| Config | pydantic-settings — `config/settings.py` |
+| Database | ArangoDB 3.12 (documents + graph + cosine AQL) |
+| DB client | python-arango — `db/arango_client.py` |
+| AQL queries | `db/queries.py` |
+| Embeddings | nomic-embed-text via Ollama (768-dim) |
+| LLM | qwen2.5-coder:7b via Ollama |
+| API models | `models/api_models.py` |
+
+Everything runs locally — no cloud APIs, no external vector DB.
 
 ---
 
@@ -58,376 +285,62 @@ Agent-ready context
 
 | Collection | Type | Purpose |
 |---|---|---|
-| `memory_events` | Document | Raw input before processing |
 | `episodic_memories` | Document | Time-bound events |
 | `semantic_memories` | Document | Facts and stable knowledge |
 | `procedural_memories` | Document | Workflows and SOPs |
 | `entities` | Document | Extracted named entities |
 | `provenance_records` | Document | Source traceability |
-| `memory_mentions_entity` | Edge | Memory → Entity links |
-| `memory_has_provenance` | Edge | Memory → Provenance links |
-| `entity_related_to_entity` | Edge | Entity → Entity links (future) |
+| `memory_merge_logs` | Document | Audit trail for merges |
+| `reflective_memories` | Document | LLM-detected patterns (Phase 3) |
+| `summary_memories` | Document | Temporal rollup summaries (Phase 3) |
+| `memory_mentions_entity` | Edge | Memory → Entity |
+| `memory_has_provenance` | Edge | Memory → Provenance record |
+| `reflection_supported_by_memory` | Edge | Reflection → Supporting memories (Phase 3) |
+| `summary_contains_memory` | Edge | Summary → Summarized memories (Phase 3) |
 
 ---
 
 ## Setup
 
-### 1. Start ArangoDB
-
 ```bash
-docker run -d \
-  --name arangodb \
-  -p 8529:8529 \
-  -e ARANGO_ROOT_PASSWORD=openSesame \
-  arangodb
+# 1. Start ArangoDB
+docker run -d --name arangodb -p 8529:8529 -e ARANGO_ROOT_PASSWORD=openSesame arangodb
+
+# 2. Start Ollama and pull models
+ollama pull qwen2.5-coder:7b
+ollama pull nomic-embed-text
+
+# 3. Install dependencies
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# 4. Configure environment
+cp .env.example .env   # credentials already pre-filled
+
+# 5. Create collections
+.venv/bin/python db/setup_db.py
+.venv/bin/python migrations/phase_2_schema_migration.py
+.venv/bin/python migrations/phase_3_schema_migration.py
+
+# 6. Start the server
+.venv/bin/uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 2. Install dependencies
-
-```bash
-cd memory_phase_1
-pip install -r requirements.txt
-```
-
-### 3. Configure environment
-
-Copy and edit the example env file:
-
-```bash
-cp .env.example .env
-```
-
-Default values match the local Ollama + ArangoDB setup:
-
-```env
-ARANGO_HOST=http://localhost:8529
-ARANGO_DB=memory_poc
-ARANGO_USERNAME=root
-ARANGO_PASSWORD=openSesame
-
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_CHAT_MODEL=qwen2.5-coder:7b
-OLLAMA_EMBED_MODEL=nomic-embed-text
-
-MEMORY_THRESHOLD=0.50
-```
-
-### 4. Create database collections
-
-```bash
-python db/setup_db.py
-```
-
-### 5. Start the API server
-
-```bash
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
-```
-
-API docs available at: http://localhost:8000/docs
+API docs: http://localhost:8000/docs
 
 ---
 
-## API Examples
-
-### Add Memory
+## Running Tests
 
 ```bash
-curl -X POST http://localhost:8000/memory/add \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "default",
-    "text": "Customer ABC reported repeated payment gateway failures on Monday.",
-    "source": "ticketing",
-    "metadata": {
-      "source_document_id": "ticket_001",
-      "user_id": "user_123"
-    }
-  }'
+# End-to-end feature test (recommended)
+.venv/bin/python demo_test.py
+
+# Unit tests only (no ArangoDB/Ollama required)
+.venv/bin/python -m pytest tests/test_importance_scorer.py tests/test_confidence_scorer.py tests/test_temporal_memory.py -v
+
+# All integration tests
+.venv/bin/python -m pytest tests/ -v
 ```
 
-Response (stored):
-
-```json
-{
-  "status": "stored",
-  "memory_id": "a3f8c91d2e4b6f78",
-  "memory_type": "episodic",
-  "memory_score": 0.88,
-  "entities": [
-    {"name": "Customer ABC", "type": "customer"},
-    {"name": "Payment Gateway", "type": "system"}
-  ]
-}
-```
-
-Response (not stored — duplicate or low-signal input):
-
-```json
-{
-  "status": "not_stored",
-  "reason": "memory_score_below_threshold",
-  "memory_score": 0.31
-}
-```
-
----
-
-### Retrieve Memory
-
-```bash
-curl -X POST http://localhost:8000/memory/retrieve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "default",
-    "query": "What payment issues did Customer ABC face?",
-    "top_k": 5
-  }'
-```
-
-Response:
-
-```json
-{
-  "query": "What payment issues did Customer ABC face?",
-  "context": {
-    "facts": [
-      {
-        "memory_id": "b1c2d3e4f5a6b7c8",
-        "text": "Customer ABC uses Payment Gateway X for checkout transactions.",
-        "score": 0.87
-      }
-    ],
-    "events": [
-      {
-        "memory_id": "a3f8c91d2e4b6f78",
-        "text": "Customer ABC reported repeated payment gateway failures on Monday.",
-        "score": 0.91
-      }
-    ],
-    "procedures": [
-      {
-        "memory_id": "d4e5f6a7b8c9d0e1",
-        "text": "For payment gateway failure, check transaction logs, retry queue, and notify finance operations.",
-        "score": 0.76
-      }
-    ],
-    "citations": [
-      {
-        "memory_id": "a3f8c91d2e4b6f78",
-        "source_system": "ticketing",
-        "source_document_id": "ticket_001"
-      }
-    ]
-  }
-}
-```
-
----
-
-## Sample Test Data
-
-Load all three memory types:
-
-```bash
-# Episodic
-curl -X POST http://localhost:8000/memory/add -H "Content-Type: application/json" \
-  -d '{"tenant_id":"default","text":"Customer ABC reported repeated payment gateway failures on Monday.","source":"ticketing","metadata":{"source_document_id":"ticket_001"}}'
-
-# Semantic
-curl -X POST http://localhost:8000/memory/add -H "Content-Type: application/json" \
-  -d '{"tenant_id":"default","text":"Customer ABC uses Payment Gateway X for checkout transactions.","source":"crm","metadata":{"source_document_id":"crm_001"}}'
-
-# Procedural
-curl -X POST http://localhost:8000/memory/add -H "Content-Type: application/json" \
-  -d '{"tenant_id":"default","text":"For payment gateway failure, check transaction logs, retry queue, and notify finance operations.","source":"docs","metadata":{"source_document_id":"runbook_001"}}'
-```
-
-Then retrieve:
-
-```bash
-curl -X POST http://localhost:8000/memory/retrieve -H "Content-Type: application/json" \
-  -d '{"tenant_id":"default","query":"What payment issues did Customer ABC face?","top_k":5}'
-```
-
----
-
-## Run Tests
-
-```bash
-pytest tests/ -v
-```
-
-Tests require ArangoDB and Ollama to be running.
-
----
-
-## Candidate Scoring
-
-```
-memory_score = 0.60 × novelty + 0.40 × source_weight
-```
-
-Source weights:
-
-| Source | Weight |
-|---|---|
-| erp | 1.00 |
-| crm | 0.90 |
-| ticketing | 0.80 |
-| docs | 0.70 |
-| email | 0.60 |
-| slack / chat | 0.40 |
-| unknown | 0.30 |
-
-Novelty = `1 - max_cosine_similarity` vs all existing memories. First memory gets novelty = 1.0.
-
-Memories with `memory_score < 0.50` are not stored.
-
----
-
-## Hybrid Retrieval
-
-```
-final_score = 0.70 × semantic_score + 0.30 × graph_score
-```
-
-- **Semantic** — AQL cosine similarity across all memory collections (works on all ArangoDB versions)
-- **Graph** — inbound edge traversal from entities matched in the query
-
----
-
-## Phase 2 Scoring Formulas
-
-### Importance
-```
-importance = 0.40 × impact + 0.25 × frequency + 0.20 × recency + 0.15 × usage
-impact     = (source_weight + memory_type_weight) / 2
-frequency  = min(duplicate_count / 5, 1.0)   # 0.20 for new memories
-recency    = max(0, 1 − days_old / 30)        # 1.0 for new memories
-usage      = min(access_count / 10, 1.0)     # 0.0 for new memories
-```
-
-### Confidence
-```
-confidence = 0.40 × reliability + 0.30 × agreement + 0.20 × recency + 0.10 × accuracy
-agreement  = 1.0 (dup≥3) | 0.75 (dup=2) | 0.50 (dup=1) | 0.20 (new)
-```
-
-### Quality (combined ranking signal)
-```
-quality_score = 0.60 × importance_score + 0.40 × confidence_score
-```
-
-### Consolidation (deduplication)
-```
-consolidation_score = 0.70 × embedding_similarity
-                    + 0.20 × entity_overlap (Jaccard)
-                    + 0.10 × type_match
-```
-Threshold: **0.80** — memories scoring above are merged, not stored as new.
-
-### Phase 2 Retrieval Ranking
-```
-final_score = 0.50 × semantic_score
-            + 0.20 × graph_score
-            + 0.20 × importance_score
-            + 0.10 × confidence_score
-```
-
----
-
-## Phase 2 Setup
-
-Run schema migration once after upgrade:
-
-```bash
-python migrations/phase_2_schema_migration.py
-```
-
-This adds Phase 2 fields to existing memories and creates the `memory_merge_logs` collection.
-
----
-
-## Phase 2 API Examples
-
-### Stored response (new memory)
-
-```json
-{
-  "status": "stored",
-  "memory_id": "42e2b740f507452c",
-  "memory_type": "episodic",
-  "memory_score": 0.92,
-  "importance_score": 0.55,
-  "confidence_score": 0.685,
-  "quality_score": 0.604,
-  "temporal": {
-    "valid_from": "2026-06-07T10:00:00Z",
-    "valid_to": "2026-06-07T10:00:00Z",
-    "recorded_at": "2026-06-07T15:38:14Z"
-  },
-  "entities": [{"name": "ABC", "type": "customer"}]
-}
-```
-
-### Merged response (near-duplicate)
-
-```json
-{
-  "status": "merged",
-  "target_memory_id": "42e2b740f507452c",
-  "target_collection": "episodic_memories",
-  "consolidation_score": 0.8168,
-  "duplicate_count": 1,
-  "importance_score": 0.55,
-  "confidence_score": 0.775,
-  "quality_score": 0.64
-}
-```
-
-### Retrieval response (Phase 2)
-
-```json
-{
-  "query": "What payment issues did Customer ABC face?",
-  "context": {
-    "events": [{
-      "memory_id": "42e2b740f507452c",
-      "text": "Customer ABC reported repeated payment gateway failures on Monday.",
-      "score": 0.5475,
-      "importance_score": 0.55,
-      "confidence_score": 0.775,
-      "quality_score": 0.64,
-      "valid_from": "2026-06-07T10:00:00Z",
-      "valid_to": "2026-06-07T10:00:00Z"
-    }],
-    "citations": [{
-      "memory_id": "42e2b740f507452c",
-      "source_system": "ticketing",
-      "source_document_id": "ticket_001",
-      "confidence_score": 0.775
-    }]
-  }
-}
-```
-
----
-
-## Phase 1 Limitations
-
-- No reflection or summarization pipeline
-- No memory promotion or retention/decay
-- No BM25 keyword search
-- No temporal weighting
-- No multi-tenant isolation beyond `tenant_id` filtering
-- Vector index creation attempted but falls back to AQL cosine similarity if ArangoDB < 3.12
-- LLM calls are synchronous; high-throughput use cases should add async queuing
-
----
-
-## Next Phases
-
-- Phase 3: Reflection pipeline, memory summarization, promotion engine
-- Phase 4: Retention/decay lifecycle, full ontology enforcement
-- Phase 5: Multi-tenant isolation, benchmarking, UI dashboard
+See `COMMANDS.md` for the full curl command reference.
