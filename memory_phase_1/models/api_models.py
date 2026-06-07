@@ -68,10 +68,31 @@ class Citation(BaseModel):
     confidence_score: Optional[float] = None
 
 
+class ReflectionItem(BaseModel):
+    memory_id: str
+    text: str
+    score: float
+    pattern_type: Optional[str] = None
+    support_count: Optional[int] = None
+    confidence_score: Optional[float] = None
+    supporting_memory_ids: list[str] = []
+
+
+class SummaryItem(BaseModel):
+    memory_id: str
+    text: str
+    score: float
+    summary_level: Optional[str] = None
+    memory_count: Optional[int] = None
+    confidence_score: Optional[float] = None
+
+
 class MemoryContext(BaseModel):
     facts: list[MemoryItem] = []
     events: list[MemoryItem] = []
     procedures: list[MemoryItem] = []
+    reflections: list[ReflectionItem] = []
+    summaries: list[SummaryItem] = []
     citations: list[Citation] = []
 
 

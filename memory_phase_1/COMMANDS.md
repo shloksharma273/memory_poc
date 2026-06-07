@@ -49,6 +49,8 @@ This project uses all three models simultaneously:
 | `entities` | Extracted named entities |
 | `provenance_records` | Source traceability metadata |
 | `memory_merge_logs` | Audit trail for merged/consolidated memories |
+| `reflective_memories` | LLM-detected patterns stored as reflective memories (Phase 3) |
+| `summary_memories` | Temporal rollup summaries of memory clusters (Phase 3) |
 
 **Edge collections:**
 
@@ -57,6 +59,8 @@ This project uses all three models simultaneously:
 | `memory_mentions_entity` | Memory → Entity |
 | `memory_has_provenance` | Memory → Provenance record |
 | `entity_related_to_entity` | Entity → Entity (reserved for future use) |
+| `reflection_supported_by_memory` | Reflective memory → Supporting episodic/semantic/procedural memory (Phase 3) |
+| `summary_contains_memory` | Summary memory → Summarized memory (Phase 3) |
 
 ### Start ArangoDB with Docker
 
@@ -161,6 +165,24 @@ Expected output:
 [+] Created collection: memory_merge_logs
 [+] episodic_memories: migrated N documents
 [OK] Phase 2 migration complete.
+```
+
+### Run Phase 3 schema migration
+
+Run once after upgrading to Phase 3 (creates `reflective_memories`, `summary_memories`, and edge collections):
+
+```bash
+.venv/bin/python migrations/phase_3_schema_migration.py
+```
+
+Expected output:
+
+```
+[+] Created collection: reflective_memories
+[+] Created collection: summary_memories
+[+] Created edge collection: reflection_supported_by_memory
+[+] Created edge collection: summary_contains_memory
+[OK] Phase 3 migration complete.
 ```
 
 ---
@@ -368,7 +390,114 @@ Expected — all three memory types returned with quality scores and citations:
 
 ---
 
-## 7. Run Tests
+## 7. Demo — Phase 3: Reflect and Summarize
+
+### Trigger reflection (detect patterns and create reflective memories)
+
+The reflect endpoint clusters existing memories, detects recurring patterns via LLM, and stores reflective memories for future retrieval.
+
+```bash
+curl -s -X POST http://localhost:8000/intelligence/reflect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "default",
+    "time_window_days": 30,
+    "min_quality_score": 0.0,
+    "similarity_threshold": 0.65,
+    "min_cluster_size": 2
+  }' | python3 -m json.tool
+```
+
+Expected response:
+
+```json
+{
+    "status": "completed",
+    "candidate_count": 3,
+    "cluster_count": 1,
+    "patterns_detected": 1,
+    "reflections_created": 1,
+    "reflections_updated": 0
+}
+```
+
+Parameters:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `time_window_days` | 30 | How far back to pull candidate memories |
+| `min_quality_score` | 0.60 | Minimum quality to include a memory as candidate (use 0.0 to include all) |
+| `similarity_threshold` | 0.75 | Cosine similarity required for two memories to be in the same cluster (lower = looser clusters) |
+| `min_cluster_size` | 3 | Minimum memories in a cluster to trigger pattern detection (use 2 for small datasets) |
+
+### Trigger summarization
+
+Creates a rollup summary of memories grouped by time window or entity.
+
+```bash
+curl -s -X POST http://localhost:8000/intelligence/summarize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "default",
+    "summary_level": "weekly",
+    "group_by": "time"
+  }' | python3 -m json.tool
+```
+
+### List all reflective memories
+
+```bash
+curl -s "http://localhost:8000/intelligence/reflections?tenant_id=default" | python3 -m json.tool
+```
+
+Expected:
+
+```json
+{
+    "reflections": [
+        {
+            "reflection_id": "36675fdf820d46fd",
+            "reflection_text": "Customer ABC has experienced multiple payment gateway issues following recent deployments.",
+            "pattern_type": "recurring_issue",
+            "support_count": 2,
+            "quality_score": 0.7675,
+            "importance_score": 0.75,
+            "confidence_score": 0.7675,
+            "supporting_memory_ids": [
+                "episodic_memories/31cfa3b97d904991",
+                "episodic_memories/532a142cfd1c4cba"
+            ],
+            "created_at": "2026-06-07T18:25:00Z"
+        }
+    ]
+}
+```
+
+### List all summary memories
+
+```bash
+curl -s "http://localhost:8000/intelligence/summaries?tenant_id=default" | python3 -m json.tool
+```
+
+### Retrieve — verify reflections appear in context
+
+After triggering reflection, a retrieve call will include reflective memories in a dedicated `reflections` field with the highest `final_score` (type boost = 1.00):
+
+```bash
+curl -s -X POST http://localhost:8000/memory/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "default",
+    "query": "payment processing errors",
+    "top_k": 10
+  }' | python3 -m json.tool
+```
+
+The `context.reflections` array in the response contains reflective memories with `pattern_type`, `support_count`, and `supporting_memory_ids`.
+
+---
+
+## 8. Run Tests
 
 ### Unit tests only (no ArangoDB or Ollama needed)
 
@@ -400,16 +529,18 @@ Expected — all three memory types returned with quality scores and citations:
 
 Run these in the ArangoDB Web UI → Query Editor, or via arangosh.
 
-### Count all stored memories
+### Count all stored memories (including Phase 3)
 
 ```aql
 RETURN {
-  episodic  : LENGTH(episodic_memories),
-  semantic  : LENGTH(semantic_memories),
-  procedural: LENGTH(procedural_memories),
-  events    : LENGTH(memory_events),
-  entities  : LENGTH(entities),
-  merges    : LENGTH(memory_merge_logs)
+  episodic    : LENGTH(episodic_memories),
+  semantic    : LENGTH(semantic_memories),
+  procedural  : LENGTH(procedural_memories),
+  events      : LENGTH(memory_events),
+  entities    : LENGTH(entities),
+  merges      : LENGTH(memory_merge_logs),
+  reflections : LENGTH(reflective_memories),
+  summaries   : LENGTH(summary_memories)
 }
 ```
 
@@ -469,6 +600,29 @@ FOR doc IN episodic_memories
   FILTER doc.source == "ticketing"
   SORT doc.quality_score DESC
   RETURN {id: doc._key, text: doc.text, quality: doc.quality_score}
+```
+
+### View all reflective memories
+
+```aql
+FOR doc IN reflective_memories
+  SORT doc.quality_score DESC
+  RETURN {
+    id          : doc._key,
+    text        : doc.reflection_text,
+    pattern_type: doc.pattern_type,
+    support_count: doc.support_count,
+    quality     : doc.quality_score,
+    supporting  : doc.supporting_memory_ids
+  }
+```
+
+### View which memories support a reflection (graph traversal)
+
+```aql
+LET reflection_id = "reflective_memories/YOUR_REFLECTION_KEY_HERE"
+FOR v, e IN 1..1 OUTBOUND reflection_id reflection_supported_by_memory
+  RETURN {memory: v._key, text: v.text != null ? v.text : v.fact, type: v.type}
 ```
 
 ### Find temporally bounded memories (what was true on a specific date)
@@ -585,6 +739,10 @@ print('Citations:',  len(ctx['citations']))
 | `model not found` error | Run `ollama pull qwen2.5-coder:7b && ollama pull nomic-embed-text` |
 | `Collection not found` error | Run `python db/setup_db.py` |
 | `importance_score: null` in old memories | Run `python migrations/phase_2_schema_migration.py` |
+| `reflective_memories` collection not found | Run `python migrations/phase_3_schema_migration.py` |
 | All memories return `not_stored` | Lower `MEMORY_THRESHOLD` in `.env` (currently `0.35`) |
 | Near-duplicates not merging | Lower `CONSOLIDATION_THRESHOLD` in `services/consolidation_service.py` (currently `0.80`) |
+| `cluster_count=0` on reflect | Lower `similarity_threshold` (e.g. `0.65`) and/or `min_cluster_size` (e.g. `2`) in the request body |
+| `patterns_detected=0` despite cluster forming | Lower `min_quality_score` to `0.0` — default `0.60` may exclude low-scored memories |
+| Reflections not appearing in retrieve | Confirm `POST /intelligence/reflect` returned `reflections_created >= 1` first |
 | Slow responses | LLM calls are synchronous — normal for local Ollama with 7B model |
